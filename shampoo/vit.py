@@ -221,16 +221,43 @@ def train(args: argparse.Namespace):
         inv_root_override=2,
         exponent_multiplier=1,
         start_preconditioning_step=args.warmup_steps+1,
-        use_nadam=True,
+        use_nadam=False,
         use_decoupled_weight_decay=True,
         grafting_config=AdamGraftingConfig(beta2=0.99, epsilon=1e-8),
         distributed_config=DDPShampooConfig()
     )
+    start_epoch = 0
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"=> loading checkpoint '{args.resume}'")
+            # 분산 학습 환경에서는 master process(rank 0)만 로드하고 다른 프로세스에 broadcast 하거나,
+            # 각 프로세스가 동일한 파일을 로드하게 할 수 있습니다. 후자가 더 간단합니다.
+            # 체크포인트는 항상 CPU에 먼저 로드하는 것이 안전합니다.
+            checkpoint = torch.load(args.resume, map_location=f'cuda:{local_rank}')
+
+            # 현재 저장된 체크포인트는 모델 가중치만 포함하고 있습니다.
+            if 'model_state_dict' in checkpoint:
+                 model.module.load_state_dict(checkpoint['model_state_dict'])
+            else: # 이전 방식 호환 (model.module.state_dict()만 저장한 경우)
+                 model.module.load_state_dict(checkpoint)
+
+            # 옵티마이저 상태가 있다면 로드 (새로운 체크포인트 방식)
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("=> loaded optimizer state")
+
+            # 시작할 에폭 번호가 있다면 설정
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                print(f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
+        else:
+            print(f"=> no checkpoint found at '{args.resume}'")
 
     # --- 학습 루프 ---
     total_steps = len(train_loader) * args.epochs
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         model.train()
         
@@ -263,7 +290,7 @@ def train(args: argparse.Namespace):
         
         # --- 검증 ---
         model.eval()
-        correct = 0
+        correct = 0 
         total = 0
         val_loss_sum = 0.0
         num_batches = len(val_loader)
@@ -306,9 +333,13 @@ def train(args: argparse.Namespace):
                 writer.add_scalar('validation_loss', avg_val_loss, epoch)
 
             if (epoch + 1) % args.save_interval == 0:
-                # DDP 모델의 state_dict는 model.module에서 가져옵니다.
-                torch.save(model.module.state_dict(), f"vit_s16_imagenet_epoch_{epoch+1}.pth")
-
+                save_path = os.path.join(args.save_dir, f"vit_checkpoint_epoch_{epoch+1}.pth")
+                print(f"Saving checkpoint to {save_path}")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, save_path)
     if writer:
         writer.close()
     cleanup()
@@ -320,14 +351,14 @@ if __name__ == '__main__':
     parser.add_argument('--data-path', type=str, required=True, help='Path to cache Hugging Face datasets')
     parser.add_argument('--log-dir', type=str, default='logs', help='Directory for TensorBoard logs')
     parser.add_argument('--epochs', type=int, default=90, help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=256, help='Batch size per GPU')
+    parser.add_argument('--batch-size', type=int, default=128, help='Batch size per GPU')
     parser.add_argument('--workers', type=int, default=4, help='Number of data loading workers')
-    parser.add_argument('--log-interval', type=int, default=200, help='Logging frequency')
-    parser.add_argument('--save-interval', type=int, default=20, help='Checkpoint saving frequency')
+    parser.add_argument('--log-interval', type=int, default=300, help='Logging frequency')
+    parser.add_argument('--save-interval', type=int, default=15, help='Checkpoint saving frequency')
 
     # 학습률 관련 인자
     parser.add_argument('--base-lr', type=float, default=0.0013, help='Base learning rate')
-    parser.add_argument('--warmup-steps', type=int, default=7510, help='Number of warmup steps')
+    parser.add_argument('--warmup-steps', type=int, default=15000, help='Number of warmup steps')
 
     # [추가] 데이터 증강 관련 인자 (Algoperf 기본값 설정)
     parser.add_argument('--mixup', type=float, default=0.2, help='Mixup alpha (default: 0.2). Set 0 to disable.')
@@ -337,6 +368,9 @@ if __name__ == '__main__':
     parser.add_argument('--weight-decay', type=float, default=0.0005, help='Weight decay (default: 0.1)')
     parser.add_argument('--beta1', type=float, default=0.95, help='Beta1/Momentum (default: 0.9)')
     
+    parser.add_argument('--save-dir', type=str, default='checkpoints', help='Directory for saving checkpoints')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+
     args = parser.parse_args()
 
     # torchrun을 통해 실행 (LOCAL_RANK, WORLD_SIZE는 환경 변수로 설정됨)
